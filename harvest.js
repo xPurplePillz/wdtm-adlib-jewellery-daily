@@ -182,13 +182,25 @@ async function main() {
 
   // 1. Load a real search and capture the request the page makes when you scroll
   let captured = null;
+  // Facebook's page sends several requests that mention the search term. Only
+  // the one that loads more results has page-turning info (cursor) and a
+  // countries list, so that's the only one we accept.
+  const seenQueries = [];
   page.on('request', req => {
     if (captured) return;
     const url = req.url();
     const body = req.postData() || '';
-    if (url.includes('/api/graphql') && body.includes('variables') && body.includes('queryString')) {
-      captured = { url, body, headers: pickHeaders(req.headers()) };
-    }
+    if (!url.includes('/api/graphql') || !body.includes('variables')) return;
+    let vars = null, name = '';
+    try {
+      const params = new URLSearchParams(body);
+      vars = JSON.parse(params.get('variables') || 'null');
+      name = params.get('fb_api_req_friendly_name') || req.headers()['x-fb-friendly-name'] || '';
+    } catch (e) { return; }
+    if (!vars || typeof vars !== 'object') return;
+    seenQueries.push((name || 'unnamed') + ' [' + Object.keys(vars).join(',') + ']');
+    const isResults = 'queryString' in vars && 'cursor' in vars && Array.isArray(vars.countries);
+    if (isResults) captured = { url, body, headers: pickHeaders(req.headers()), name };
   });
 
   const startUrl = (process.env.ADLIB_BASE || 'https://www.facebook.com') + '/ads/library/?active_status=active&ad_type=all'
@@ -199,17 +211,20 @@ async function main() {
   await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(4000);
   await dismissPopups(page);
-  for (let i = 0; i < 15 && !captured; i++) {
+  for (let i = 0; i < 20 && !captured; i++) {
     await page.mouse.wheel(0, 3000);
+    if (i % 2 === 1) await page.keyboard.press('End').catch(() => {});
     await sleep(2500);
     if (i % 3 === 2) await dismissPopups(page);
   }
   if (!captured) {
+    log('Requests the page made instead:\n   ' + (seenQueries.join('\n   ') || 'none'));
     await page.screenshot({ path: 'debug.png' }).catch(() => {});
     fs.writeFileSync('debug.html', await page.content().catch(() => ''));
     throw new Error('Could not capture the Ad Library search request. Meta may be blocking this connection. See debug.png in the run artifacts.');
   }
-  log('Captured the search request.');
+  log('Captured the search request' + (captured.name ? ' (' + captured.name + ')' : '') + '.');
+  if (seenQueries.length > 1) log('Skipped side requests:\n   ' + seenQueries.slice(0, -1).join('\n   '));
 
   // What did Facebook actually show this connection? Saved for the debug download.
   await page.screenshot({ path: 'page.png' }).catch(() => {});
