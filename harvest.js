@@ -209,10 +209,20 @@ async function main() {
     fs.writeFileSync('debug.html', await page.content().catch(() => ''));
     throw new Error('Could not capture the Ad Library search request. Meta may be blocking this connection. See debug.png in the run artifacts.');
   }
-  log('Captured the search request. Starting searches.');
+  log('Captured the search request.');
+
+  // What did Facebook actually show this connection? Saved for the debug download.
+  await page.screenshot({ path: 'page.png' }).catch(() => {});
+  const visibleAds = await page.getByText(/Library ID/i).count().catch(() => -1);
+  log(`Ads visible on the page itself: ${visibleAds}`);
 
   const baseParams = new URLSearchParams(captured.body);
   const baseVars = JSON.parse(baseParams.get('variables'));
+  log('Captured search settings:', JSON.stringify({
+    keys: Object.keys(baseVars), queryString: baseVars.queryString, searchType: baseVars.searchType,
+    mediaType: baseVars.mediaType, sortData: baseVars.sortData, first: baseVars.first,
+    countries: baseVars.countries, activeStatus: baseVars.activeStatus, hasCursor: !!baseVars.cursor,
+  }));
 
   async function replay(vars) {
     baseParams.set('variables', JSON.stringify(vars));
@@ -228,6 +238,56 @@ async function main() {
     }, { url: captured.url, body: baseParams.toString(), headers: captured.headers });
   }
 
+  // Builds the search. level 2 = newest first (what we want), level 1 = keep
+  // Facebook's own sort order, level 0 = change nothing but the term and country.
+  function makeVars(term, country, level) {
+    const v = JSON.parse(JSON.stringify(baseVars));
+    v.queryString = quoteTerm(term);
+    v.countries = [country];
+    v.cursor = null;
+    if (level >= 1) {
+      v.first = CONFIG.adsPerRequest;
+      if ('mediaType' in v) v.mediaType = 'all';
+      if ('searchType' in v) v.searchType = 'keyword_exact_phrase';
+    }
+    if (level >= 2) v.sortData = Object.assign({}, v.sortData || {}, { mode: 'SORT_BY_START_DATE', direction: 'DESCENDING' });
+    return v;
+  }
+
+  function readPage(text) {
+    const ads = new Map();
+    let cursor = null;
+    const bodies = parseBodies(text);
+    bodies.forEach(b => { collectAds(b, 0, ads); if (!cursor) cursor = findCursor(b, 0); });
+    const errors = bodies.map(b => b && (b.errors || b.error)).filter(Boolean);
+    return { ads, cursor, errors, parsed: bodies.length };
+  }
+
+  // Probe: try the first term at each level so a bad tweak can't silently
+  // empty the whole run. Everything Facebook sends back is saved to diag.txt.
+  const diag = [];
+  let level = -1;
+  for (const lv of [2, 1, 0]) {
+    const res = await replay(makeVars(CONFIG.terms[0], CONFIG.countries[0], lv));
+    const r = readPage(res.text);
+    log(`Probe level ${lv}: HTTP ${res.status}, ${res.text.length} chars, ${r.ads.size} ads, ` +
+        `${r.parsed} JSON blocks${r.errors.length ? ', errors: ' + JSON.stringify(r.errors).slice(0, 300) : ''}`);
+    diag.push(`=== level ${lv} | HTTP ${res.status} | ${r.ads.size} ads ===\n` + res.text.slice(0, 4000));
+    if (r.ads.size) { level = lv; break; }
+    await sleep(jitter(CONFIG.pauseMs));
+  }
+  fs.writeFileSync('diag.txt', diag.join('\n\n'));
+  if (level < 0) {
+    await browser.close();
+    throw new Error(visibleAds > 0
+      ? 'Facebook shows ads on the page, but the replayed search returns none. The replay needs adjusting: send Claude diag.txt from the debug download.'
+      : 'Facebook showed this connection no ads at all, so it is most likely blocking GitHub. Send Claude page.png from the debug download.');
+  }
+  const newestFirst = level === 2;
+  if (!newestFirst) log(`Newest-first sorting was refused, so using level ${level} and reading more pages per search instead.`);
+  const maxPages = newestFirst ? CONFIG.maxPagesPerSearch : CONFIG.maxPagesPerSearch * 2;
+  log('Starting searches.');
+
   // 2. Every term in every country, newest first, stop at the cutoff
   const kept = new Map();
   const stats = { searches: 0, requests: 0, ads_seen: 0, ads_kept: 0, empty_searches: 0, failures: 0, throttled: false };
@@ -237,17 +297,10 @@ async function main() {
   for (const term of CONFIG.terms) {
     for (const country of CONFIG.countries) {
       stats.searches++;
-      const vars = JSON.parse(JSON.stringify(baseVars));
-      vars.queryString = quoteTerm(term);
-      vars.countries = [country];
-      vars.cursor = null;
-      vars.first = CONFIG.adsPerRequest;
-      vars.mediaType = 'all';
-      vars.sortData = Object.assign({}, vars.sortData || {}, { mode: 'SORT_BY_START_DATE', direction: 'DESCENDING' });
-      if ('searchType' in vars) vars.searchType = 'keyword_exact_phrase';
+      const vars = makeVars(term, country, level);
 
       let newHere = 0;
-      for (let p = 1; p <= CONFIG.maxPagesPerSearch; p++) {
+      for (let p = 1; p <= maxPages; p++) {
         let res = await replay(vars);
         stats.requests++;
         if (res.status === 429 || res.status >= 500 || res.status === 0) {
@@ -269,9 +322,7 @@ async function main() {
         }
         consecutiveFails = 0;
 
-        const ads = new Map();
-        let cursor = null;
-        parseBodies(res.text).forEach(b => { collectAds(b, 0, ads); if (!cursor) cursor = findCursor(b, 0); });
+        const { ads, cursor } = readPage(res.text);
         stats.ads_seen += ads.size;
 
         let oldest = Infinity;
@@ -280,7 +331,7 @@ async function main() {
           if (sd && sd < oldest) oldest = sd;
           if (sd >= cutoff && !kept.has(id)) { kept.set(id, slim(a, term, country)); newHere++; }
         }
-        if (!ads.size || !cursor || oldest < cutoff) break;
+        if (!ads.size || !cursor || (newestFirst && oldest < cutoff)) break;
         vars.cursor = cursor;
         await sleep(jitter(CONFIG.pauseMs));
       }

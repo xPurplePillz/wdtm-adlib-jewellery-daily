@@ -29,12 +29,14 @@ jobs:
           LOOKBACK_HOURS: ${{ vars.LOOKBACK_HOURS }}
         run: node harvest.js
 
-      - name: Save debug screenshot if it failed
-        if: failure()
+      - name: Save debug files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug
           path: |
+            page.png
+            diag.txt
             debug.png
             debug.html
           if-no-files-found: ignore
