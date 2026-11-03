@@ -3,7 +3,7 @@
 Every morning GitHub runs `harvest.js`. It opens Meta Ad Library search pages in
 a hidden Chrome (logged out), sorted most recent, and reads the 30 ads built into
 each page. Big searches are split by ad type (image / video / meme) to see more.
-It keeps ads that started in the last 48 hours and sends them to the n8n
+It keeps ads that started yesterday or today and sends them to the n8n
 workflow, which finds emails, checks them with Bouncer and adds them to Instantly.
 
 It never scrolls or asks for "more results": Facebook throttles those requests
@@ -19,7 +19,7 @@ Repo > Settings > Secrets and variables > Actions
 | `N8N_WEBHOOK_URL` | Secrets | Production URL from the "Ads From GitHub" node in n8n |
 | `N8N_WEBHOOK_SECRET` | Secrets | A long random password. Same value as the n8n credential |
 | `COUNTRIES` | Variables (optional) | `GB` by default. e.g. `GB,IE` |
-| `LOOKBACK_HOURS` | Variables (optional) | `48` by default |
+| `LOOKBACK_DAYS` | Variables (optional) | `1` by default: ads that started yesterday or today |
 
 Search terms live at the top of `harvest.js`.
 

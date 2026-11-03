@@ -20,7 +20,7 @@
  *   N8N_WEBHOOK_URL      secret, the Production URL from the n8n webhook node
  *   N8N_WEBHOOK_SECRET   secret, any long random password, same as in n8n
  *   COUNTRIES            variable, optional, e.g. GB or GB,IE (default GB)
- *   LOOKBACK_HOURS       variable, optional (default 48)
+ *   LOOKBACK_DAYS        variable, optional (default 1 = ads that started yesterday or today)
  */
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -28,7 +28,10 @@ const fs = require('fs');
 // ---- settings ---------------------------------------------------------------
 const CONFIG = {
   countries: (process.env.COUNTRIES || 'GB').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
-  lookbackHours: Number(process.env.LOOKBACK_HOURS || 48),
+  // Facebook only records the DATE an ad started, not the time. So "the last
+  // 24 hours" is done as "started yesterday or today", which never misses a day
+  // even if GitHub starts the run a bit late (it sometimes does).
+  lookbackDays: Number(process.env.LOOKBACK_DAYS || 1),
   pageGapMs: 2500,      // gap between page loads, jittered
   fullPage: 30,         // Facebook shows 30 ads per page. A full page means there's more to split out.
   splitBy: ['image', 'video', 'meme'],
@@ -167,7 +170,9 @@ async function adsOnPage(page) {
 
 async function main() {
   if (!DRY_RUN && !WEBHOOK) throw new Error('N8N_WEBHOOK_URL is not set. Add it as a GitHub secret.');
-  const cutoff = Math.floor(Date.now() / 1000) - CONFIG.lookbackHours * 3600;
+  const today = new Date();
+  const cutoff = Math.floor(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()) / 1000)
+                 - CONFIG.lookbackDays * 86400;
   log(`Looking for ads started since ${new Date(cutoff * 1000).toISOString()} in ${CONFIG.countries.join(', ')}`);
 
   const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROME_PATH || undefined,

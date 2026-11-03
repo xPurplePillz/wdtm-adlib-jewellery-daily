@@ -2,7 +2,7 @@ name: Daily jewellery ad harvest
 
 on:
   schedule:
-    - cron: "17 6 * * *"   # every day at 06:17 UTC (6:17am UK winter, 7:17am summer)
+    - cron: "17 6 * * *"   # every morning at 06:17 UTC (6:17am UK winter, 7:17am summer). Picks up ads that started yesterday.
   workflow_dispatch:        # adds a "Run workflow" button for testing
 
 jobs:
@@ -26,7 +26,7 @@ jobs:
           N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
           N8N_WEBHOOK_SECRET: ${{ secrets.N8N_WEBHOOK_SECRET }}
           COUNTRIES: ${{ vars.COUNTRIES }}
-          LOOKBACK_HOURS: ${{ vars.LOOKBACK_HOURS }}
+          LOOKBACK_DAYS: ${{ vars.LOOKBACK_DAYS }}
         run: node harvest.js
 
       - name: Save debug files
