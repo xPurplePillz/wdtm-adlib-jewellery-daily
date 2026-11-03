@@ -1,0 +1,14 @@
+{
+  "name": "wdtm-adlib-daily",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Daily Meta Ad Library harvest for jewellery brands, sent to n8n",
+  "main": "harvest.js",
+  "scripts": {
+    "start": "node harvest.js",
+    "dry-run": "node harvest.js --dry-run"
+  },
+  "dependencies": {
+    "playwright": "1.64.1"
+  }
+}
