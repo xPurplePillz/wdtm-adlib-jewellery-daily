@@ -1,11 +1,14 @@
 # WDTM daily jewellery ad harvest
 
-Every morning GitHub runs `harvest.js`. It opens the Meta Ad Library in a hidden
-Chrome (logged out), searches Kyle's jewellery terms newest first, keeps ads that
-started in the last 48 hours, and sends them to the n8n workflow, which finds
-emails, checks them with Bouncer and adds them to Instantly.
+Every morning GitHub runs `harvest.js`. It opens Meta Ad Library search pages in
+a hidden Chrome (logged out), sorted most recent, and reads the 30 ads built into
+each page. Big searches are split by ad type (image / video / meme) to see more.
+It keeps ads that started in the last 48 hours and sends them to the n8n
+workflow, which finds emails, checks them with Bouncer and adds them to Instantly.
 
-Based on Kyle's adlib harvester v16. No third-party scraping service.
+It never scrolls or asks for "more results": Facebook throttles those requests
+from GitHub's computers, but plain page loads work. Search terms and junk rules
+are Kyle's. No third-party scraping service.
 
 ## Settings
 

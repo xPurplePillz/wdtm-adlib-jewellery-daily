@@ -2,11 +2,13 @@
  * WDTM DAILY AD LIBRARY HARVEST
  *
  * Our own scraper. No third-party scraping service.
- * Built on Kyle's harvester (v16): it opens the Ad Library like a normal
- * logged-out visitor, captures the search request the page makes, then replays
- * that request for each search term, newest ads first. Each search stops as
- * soon as it reaches ads older than the lookback window, so a daily run is a
- * small number of requests.
+ * Opens Ad Library search pages like a normal logged-out visitor, sorted most
+ * recent first, and reads the ads Facebook builds into each page (30 per page).
+ * It never scrolls or asks for "more": Facebook throttles those requests from
+ * GitHub's computers, but plain page loads come back fine.
+ * Big searches are split by ad type (image / video / meme) so each part gets
+ * its own 30. Keeps ads that started in the lookback window. Search terms and
+ * junk rules are Kyle's.
  *
  * Sends the new ads to your n8n webhook, which does the rest.
  *
@@ -27,10 +29,9 @@ const fs = require('fs');
 const CONFIG = {
   countries: (process.env.COUNTRIES || 'GB').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
   lookbackHours: Number(process.env.LOOKBACK_HOURS || 48),
-  maxPagesPerSearch: Number(process.env.MAX_PAGES || 6),
-  adsPerRequest: 30,
-  pauseMs: 1800,        // gap between requests, jittered
-  termGapMs: 4000,      // gap between searches
+  pageGapMs: 2500,      // gap between page loads, jittered
+  fullPage: 30,         // Facebook shows 30 ads per page. A full page means there's more to split out.
+  splitBy: ['image', 'video', 'meme'],
   // Kyle's terms: exact phrases, trade words only, broadest first.
   terms: [
     'jewellery', 'jewelry', 'handmade jewellery', 'handmade jewelry', 'fine jewellery',
@@ -91,7 +92,7 @@ function parseBodies(text) {
 // Walks the tree for anything shaped like an ad, rather than a fixed path,
 // because Meta reshapes its payloads regularly.
 function collectAds(node, depth, out) {
-  if (!node || typeof node !== 'object' || depth > 14) return;
+  if (!node || typeof node !== 'object' || depth > 40) return;
   if (Array.isArray(node)) { node.forEach(n => collectAds(n, depth + 1, out)); return; }
   const id = node.ad_archive_id || node.adArchiveID || node.adArchiveId;
   if (id && (node.page_name || node.pageName || node.page_id || node.snapshot)) out.set(String(id), node);
@@ -100,23 +101,6 @@ function collectAds(node, depth, out) {
     if (v && typeof v === 'object') collectAds(v, depth + 1, out);
   }
 }
-function findCursor(node, depth) {
-  if (!node || typeof node !== 'object' || depth > 14) return null;
-  if (Array.isArray(node)) {
-    for (const n of node) { const r = findCursor(n, depth + 1); if (r) return r; }
-    return null;
-  }
-  const end = node.end_cursor || node.endCursor;
-  let more = node.has_next_page;
-  if (more === undefined) more = node.hasNextPage;
-  if (end && more !== false) return end;
-  for (const k of Object.keys(node)) {
-    const v = node[k];
-    if (v && typeof v === 'object') { const r = findCursor(v, depth + 1); if (r) return r; }
-  }
-  return null;
-}
-
 // Shapes one ad down to what n8n needs. Falls back to carousel cards when the
 // top level is empty, like Kyle's flatten script.
 function slim(a, term, country) {
@@ -158,16 +142,27 @@ async function dismissPopups(page) {
       if (await b.isVisible({ timeout: 500 })) { await b.click({ timeout: 2000 }); await sleep(800); }
     } catch (e) {}
   }
-  try { await page.keyboard.press('Escape'); } catch (e) {}
 }
 
-function pickHeaders(h) {
-  const out = {};
-  Object.keys(h || {}).forEach(k => {
-    const lk = k.toLowerCase();
-    if (lk === 'content-type' || (lk.startsWith('x-') && lk !== 'x-client-data')) out[k] = h[k];
-  });
-  return out;
+function searchUrl(term, country, media) {
+  return (process.env.ADLIB_BASE || 'https://www.facebook.com') + '/ads/library/?active_status=active&ad_type=all'
+    + '&country=' + country
+    + '&q=' + encodeURIComponent(quoteTerm(term))
+    + '&search_type=keyword_exact_phrase'
+    + '&media_type=' + media
+    + '&sort_data[mode]=relevancy_monthly_grouped&sort_data[direction]=desc';
+}
+
+// Reads the ads Facebook builds into the page itself (no extra requests).
+async function adsOnPage(page) {
+  const ads = new Map();
+  for (let tries = 0; tries < 6; tries++) {
+    const scripts = await page.$$eval('script', ss => ss.map(s => s.textContent || '').filter(t => t.includes('ad_archive_id'))).catch(() => []);
+    scripts.forEach(t => parseBodies(t).forEach(b => collectAds(b, 0, ads)));
+    if (ads.size) break;
+    await sleep(1000);
+  }
+  return ads;
 }
 
 async function main() {
@@ -179,191 +174,72 @@ async function main() {
                                            args: ['--disable-blink-features=AutomationControlled'] });
   const context = await browser.newContext({ userAgent: UA, locale: 'en-GB', viewport: { width: 1366, height: 900 } });
   const page = await context.newPage();
+  // The page tries to load more results by itself. Facebook throttles those
+  // from GitHub, and they only add noise, so block them.
+  await page.route('**/api/graphql/**', r => r.abort()).catch(() => {});
 
-  // 1. Load a real search and capture the request the page makes when you scroll
-  let captured = null;
-  // Facebook's page sends several requests that mention the search term. Only
-  // the one that loads more results has page-turning info (cursor) and a
-  // countries list, so that's the only one we accept.
-  const seenQueries = [];
-  page.on('request', req => {
-    if (captured) return;
-    const url = req.url();
-    const body = req.postData() || '';
-    if (!url.includes('/api/graphql') || !body.includes('variables')) return;
-    let vars = null, name = '';
-    try {
-      const params = new URLSearchParams(body);
-      vars = JSON.parse(params.get('variables') || 'null');
-      name = params.get('fb_api_req_friendly_name') || req.headers()['x-fb-friendly-name'] || '';
-    } catch (e) { return; }
-    if (!vars || typeof vars !== 'object') return;
-    seenQueries.push((name || 'unnamed') + ' [' + Object.keys(vars).join(',') + ']');
-    const isResults = 'queryString' in vars && 'cursor' in vars && Array.isArray(vars.countries);
-    if (isResults) captured = { url, body, headers: pickHeaders(req.headers()), name };
-  });
-
-  const startUrl = (process.env.ADLIB_BASE || 'https://www.facebook.com') + '/ads/library/?active_status=active&ad_type=all'
-    + '&country=' + CONFIG.countries[0]
-    + '&q=' + encodeURIComponent(quoteTerm(CONFIG.terms[0]))
-    + '&search_type=keyword_exact_phrase&media_type=all';
-  log('Opening the Ad Library');
-  await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await sleep(4000);
-  await dismissPopups(page);
-  for (let i = 0; i < 20 && !captured; i++) {
-    await page.mouse.wheel(0, 3000);
-    if (i % 2 === 1) await page.keyboard.press('End').catch(() => {});
-    await sleep(2500);
-    if (i % 3 === 2) await dismissPopups(page);
-  }
-  if (!captured) {
-    log('Requests the page made instead:\n   ' + (seenQueries.join('\n   ') || 'none'));
-    await page.screenshot({ path: 'debug.png' }).catch(() => {});
-    fs.writeFileSync('debug.html', await page.content().catch(() => ''));
-    throw new Error('Could not capture the Ad Library search request. Meta may be blocking this connection. See debug.png in the run artifacts.');
-  }
-  log('Captured the search request' + (captured.name ? ' (' + captured.name + ')' : '') + '.');
-  if (seenQueries.length > 1) log('Skipped side requests:\n   ' + seenQueries.slice(0, -1).join('\n   '));
-
-  // What did Facebook actually show this connection? Saved for the debug download.
-  await page.screenshot({ path: 'page.png' }).catch(() => {});
-  const visibleAds = await page.getByText(/Library ID/i).count().catch(() => -1);
-  log(`Ads visible on the page itself: ${visibleAds}`);
-
-  const baseParams = new URLSearchParams(captured.body);
-  const baseVars = JSON.parse(baseParams.get('variables'));
-  log('Captured search settings:', JSON.stringify({
-    keys: Object.keys(baseVars), queryString: baseVars.queryString, searchType: baseVars.searchType,
-    mediaType: baseVars.mediaType, sortData: baseVars.sortData, first: baseVars.first,
-    countries: baseVars.countries, activeStatus: baseVars.activeStatus, hasCursor: !!baseVars.cursor,
-  }));
-
-  async function replay(vars) {
-    baseParams.set('variables', JSON.stringify(vars));
-    return page.evaluate(async ({ url, body, headers }) => {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 45000);
-      try {
-        const r = await fetch(url, { method: 'POST', body, headers, credentials: 'include', signal: ctrl.signal });
-        return { status: r.status, text: await r.text() };
-      } catch (e) {
-        return { status: 0, text: '', error: String(e) };
-      } finally { clearTimeout(t); }
-    }, { url: captured.url, body: baseParams.toString(), headers: captured.headers });
-  }
-
-  // Builds the search. level 2 = newest first (what we want), level 1 = keep
-  // Facebook's own sort order, level 0 = change nothing but the term and country.
-  function makeVars(term, country, level) {
-    const v = JSON.parse(JSON.stringify(baseVars));
-    v.queryString = quoteTerm(term);
-    v.countries = [country];
-    v.cursor = null;
-    if (level >= 1) {
-      v.first = CONFIG.adsPerRequest;
-      if ('mediaType' in v) v.mediaType = 'all';
-      if ('searchType' in v) v.searchType = 'keyword_exact_phrase';
-    }
-    if (level >= 2) v.sortData = Object.assign({}, v.sortData || {}, { mode: 'SORT_BY_START_DATE', direction: 'DESCENDING' });
-    return v;
-  }
-
-  function readPage(text) {
-    const ads = new Map();
-    let cursor = null;
-    const bodies = parseBodies(text);
-    bodies.forEach(b => { collectAds(b, 0, ads); if (!cursor) cursor = findCursor(b, 0); });
-    const errors = bodies.map(b => b && (b.errors || b.error)).filter(Boolean);
-    return { ads, cursor, errors, parsed: bodies.length };
-  }
-
-  // Probe: try the first term at each level so a bad tweak can't silently
-  // empty the whole run. Everything Facebook sends back is saved to diag.txt.
-  const diag = [];
-  let level = -1;
-  for (const lv of [2, 1, 0]) {
-    const res = await replay(makeVars(CONFIG.terms[0], CONFIG.countries[0], lv));
-    const r = readPage(res.text);
-    log(`Probe level ${lv}: HTTP ${res.status}, ${res.text.length} chars, ${r.ads.size} ads, ` +
-        `${r.parsed} JSON blocks${r.errors.length ? ', errors: ' + JSON.stringify(r.errors).slice(0, 300) : ''}`);
-    diag.push(`=== level ${lv} | HTTP ${res.status} | ${r.ads.size} ads ===\n` + res.text.slice(0, 4000));
-    if (r.ads.size) { level = lv; break; }
-    await sleep(jitter(CONFIG.pauseMs));
-  }
-  fs.writeFileSync('diag.txt', diag.join('\n\n'));
-  if (level < 0) {
-    await browser.close();
-    throw new Error(visibleAds > 0
-      ? 'Facebook shows ads on the page, but the replayed search returns none. The replay needs adjusting: send Claude diag.txt from the debug download.'
-      : 'Facebook showed this connection no ads at all, so it is most likely blocking GitHub. Send Claude page.png from the debug download.');
-  }
-  const newestFirst = level === 2;
-  if (!newestFirst) log(`Newest-first sorting was refused, so using level ${level} and reading more pages per search instead.`);
-  const maxPages = newestFirst ? CONFIG.maxPagesPerSearch : CONFIG.maxPagesPerSearch * 2;
-  log('Starting searches.');
-
-  // 2. Every term in every country, newest first, stop at the cutoff
   const kept = new Map();
-  const stats = { searches: 0, requests: 0, ads_seen: 0, ads_kept: 0, empty_searches: 0, failures: 0, throttled: false };
-  let consecutiveFails = 0;
+  const stats = { page_loads: 0, ads_seen: 0, ads_kept: 0, empty_pages: 0, blank_in_a_row: 0, blocked: false };
+  let firstPage = true;
+
+  async function load(term, country, media) {
+    stats.page_loads++;
+    try {
+      await page.goto(searchUrl(term, country, media), { waitUntil: 'domcontentloaded', timeout: 60000 });
+    } catch (e) {
+      log(`  "${term}" [${country}/${media}] page didn't load: ${e.message.split('\n')[0]}`);
+      return null;
+    }
+    if (firstPage) { firstPage = false; await sleep(2000); await dismissPopups(page); }
+    const ads = await adsOnPage(page);
+    stats.ads_seen += ads.size;
+    let fresh = 0;
+    for (const [id, a] of ads) {
+      const sd = Number(a.start_date || a.startDate || 0);
+      if (sd >= cutoff && !kept.has(id)) { kept.set(id, slim(a, term, country)); fresh++; }
+    }
+    if (!ads.size) stats.empty_pages++;
+    return { total: ads.size, fresh };
+  }
 
   outer:
   for (const term of CONFIG.terms) {
     for (const country of CONFIG.countries) {
-      stats.searches++;
-      const vars = makeVars(term, country, level);
+      const all = await load(term, country, 'all');
+      let line = `  "${term}" [${country}] ${all ? all.total : '?'} on page, +${all ? all.fresh : 0} new`;
 
-      let newHere = 0;
-      for (let p = 1; p <= maxPages; p++) {
-        let res = await replay(vars);
-        stats.requests++;
-        if (res.status === 429 || res.status >= 500 || res.status === 0) {
-          stats.failures++;
-          log(`  "${term}" [${country}] pushback (HTTP ${res.status}). Waiting 90s and trying once more.`);
-          await sleep(90000);
-          res = await replay(vars);
-          stats.requests++;
-        }
-        if (res.status !== 200) {
-          stats.failures++;
-          consecutiveFails++;
-          if (consecutiveFails >= 3) {
-            stats.throttled = true;
-            log('Three failed searches in a row. Meta is pushing back, so stopping here and sending what we have.');
-            break outer;
-          }
-          break;
-        }
-        consecutiveFails = 0;
-
-        const { ads, cursor } = readPage(res.text);
-        stats.ads_seen += ads.size;
-
-        let oldest = Infinity;
-        for (const [id, a] of ads) {
-          const sd = Number(a.start_date || a.startDate || 0);
-          if (sd && sd < oldest) oldest = sd;
-          if (sd >= cutoff && !kept.has(id)) { kept.set(id, slim(a, term, country)); newHere++; }
-        }
-        if (!ads.size || !cursor || (newestFirst && oldest < cutoff)) break;
-        vars.cursor = cursor;
-        await sleep(jitter(CONFIG.pauseMs));
+      // The first, broadest search should always have ads. If it's blank, we're blocked.
+      if (all && all.total === 0) stats.blank_in_a_row++; else stats.blank_in_a_row = 0;
+      if (term === CONFIG.terms[0] && all && all.total === 0) {
+        await page.screenshot({ path: 'page.png' }).catch(() => {});
+        stats.blocked = true;
+        log(line);
+        log('The broadest search came back blank, so Facebook is likely blocking this connection today. Stopping.');
+        break outer;
       }
-      if (!newHere) stats.empty_searches++;
-      log(`  "${term}" [${country}] +${newHere} new ads`);
-      await sleep(jitter(CONFIG.termGapMs, 0.3));
+
+      // A full page means there are more ads than fit: split by ad type so each gets its own 30
+      if (all && all.total >= CONFIG.fullPage) {
+        for (const media of CONFIG.splitBy) {
+          await sleep(jitter(CONFIG.pageGapMs));
+          const part = await load(term, country, media);
+          if (part) line += ` | ${media} +${part.fresh}`;
+        }
+      }
+      log(line);
+      await sleep(jitter(CONFIG.pageGapMs));
     }
   }
+  await page.screenshot({ path: 'page.png' }).catch(() => {});
   await browser.close();
 
   stats.ads_kept = kept.size;
   log('Done.', JSON.stringify(stats));
   if (stats.ads_seen === 0) {
-    throw new Error('Every search came back empty. That usually means Meta blocked this connection rather than there being no ads.');
+    throw new Error('No ads on any page. Facebook is most likely blocking GitHub today. See page.png in the debug download.');
   }
 
-  // 3. Hand over to n8n
+  // Hand over to n8n
   const payload = { generated_at: new Date().toISOString(), cutoff: new Date(cutoff * 1000).toISOString(),
                     countries: CONFIG.countries, stats, ads: [...kept.values()] };
   if (DRY_RUN) {
@@ -377,7 +253,7 @@ async function main() {
     body: JSON.stringify(payload),
   });
   if (!r.ok) throw new Error(`n8n webhook answered HTTP ${r.status}. Is the workflow switched on and the secret the same in both places?`);
-  log(`Sent ${kept.size} ads to n8n.`);
+  log(`Sent ${kept.size} new ads (from ${new Set([...kept.values()].map(a => a.page_id)).size} brands) to n8n.`);
 }
 
 main().catch(e => { console.error('FAILED:', e.message); process.exit(1); });
